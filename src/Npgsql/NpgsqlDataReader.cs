@@ -391,101 +391,113 @@ namespace Npgsql
             for (StatementIndex++; StatementIndex < _statements.Count; StatementIndex++)
             {
                 var statement = _statements[StatementIndex];
-                if (statement.IsPrepared)
+                var seenParseComplete = false;
+
+                try
                 {
-                    Expect<BindCompleteMessage>(await Connector.ReadMessage(async), Connector);
-                    RowDescription = statement.Description;
-                }
-                else  // Non-prepared flow
-                {
-                    var pStatement = statement.PreparedStatement;
-                    if (pStatement != null)
+                    if (statement.IsPrepared)
                     {
-                        Debug.Assert(!pStatement.IsPrepared);
-                        Debug.Assert(pStatement.Description == null);
-                        if (pStatement.StatementBeingReplaced != null)
+                        Expect<BindCompleteMessage>(await Connector.ReadMessage(async), Connector);
+                        RowDescription = statement.Description;
+                    }
+                    else // Non-prepared flow
+                    {
+                        var pStatement = statement.PreparedStatement;
+                        if (pStatement != null)
                         {
-                            Expect<CloseCompletedMessage>(await Connector.ReadMessage(async), Connector);
-                            pStatement.StatementBeingReplaced.CompleteUnprepare();
-                            pStatement.StatementBeingReplaced = null;
+                            Debug.Assert(!pStatement.IsPrepared);
+                            Debug.Assert(pStatement.Description == null);
+                            if (pStatement.StatementBeingReplaced != null)
+                            {
+                                Expect<CloseCompletedMessage>(await Connector.ReadMessage(async), Connector);
+                                pStatement.StatementBeingReplaced.CompleteUnprepare();
+                                pStatement.StatementBeingReplaced = null;
+                            }
                         }
-                    }
 
-                    try
-                    {
                         Expect<ParseCompleteMessage>(await Connector.ReadMessage(async), Connector);
+                        seenParseComplete = true;
+
+                        Expect<BindCompleteMessage>(await Connector.ReadMessage(async), Connector);
+                        msg = await Connector.ReadMessage(async);
+
+                        RowDescription = statement.Description = msg.Code switch
+                        {
+                            BackendMessageCode.NoData => null,
+
+                            // RowDescription messages are cached on the connector, but if we're auto-preparing, we need to
+                            // clone our own copy which will last beyond the lifetime of this invocation.
+                            BackendMessageCode.RowDescription => pStatement == null
+                                ? (RowDescriptionMessage)msg
+                                : ((RowDescriptionMessage)msg).Clone(),
+
+                            _ => throw Connector.UnexpectedMessageReceived(msg.Code)
+                        };
+
+                        pStatement?.CompletePrepare();
                     }
-                    catch
+
+                    if (RowDescription == null)
                     {
-                        // An exception occurred. Check if any statements we being prepared and revert our bookkeeping.
-                        pStatement?.CompleteUnprepare();
-                        throw;
+                        // Statement did not generate a resultset (e.g. INSERT)
+                        // Read and process its completion message and move on to the next statement
+
+                        msg = await ReadMessage(async);
+                        switch (msg.Code)
+                        {
+                        case BackendMessageCode.CompletedResponse:
+                        case BackendMessageCode.EmptyQueryResponse:
+                            break;
+                        default:
+                            throw Connector.UnexpectedMessageReceived(msg.Code);
+                        }
+
+                        ProcessMessage(msg);
+                        continue;
                     }
 
-                    Expect<BindCompleteMessage>(await Connector.ReadMessage(async), Connector);
-                    msg = await Connector.ReadMessage(async);
-
-                    RowDescription = statement.Description = msg.Code switch
+                    if (StatementIndex == 0 && Command.Parameters.HasOutputParameters)
                     {
-                        BackendMessageCode.NoData => null,
+                        // If output parameters are present and this is the first row of the first resultset,
+                        // we must always read it in non-sequential mode because it will be traversed twice (once
+                        // here for the parameters, then as a regular row).
+                        msg = await Connector.ReadMessage(async);
+                        ProcessMessage(msg);
+                        if (msg.Code == BackendMessageCode.DataRow)
+                            PopulateOutputParameters();
+                    }
+                    else
+                    {
+                        msg = await ReadMessage(async);
+                        ProcessMessage(msg);
+                    }
 
-                        // RowDescription messages are cached on the connector, but if we're auto-preparing, we need to
-                        // clone our own copy which will last beyond the lifetime of this invocation.
-                        BackendMessageCode.RowDescription => pStatement == null
-                            ? (RowDescriptionMessage)msg
-                            : ((RowDescriptionMessage)msg).Clone(),
-
-                        _ => throw Connector.UnexpectedMessageReceived(msg.Code)
-                    };
-
-                    pStatement?.CompletePrepare();
-                }
-
-                if (RowDescription == null)
-                {
-                    // Statement did not generate a resultset (e.g. INSERT)
-                    // Read and process its completion message and move on to the next statement
-
-                    msg = await ReadMessage(async);
                     switch (msg.Code)
                     {
+                    case BackendMessageCode.DataRow:
                     case BackendMessageCode.CompletedResponse:
-                    case BackendMessageCode.EmptyQueryResponse:
                         break;
                     default:
                         throw Connector.UnexpectedMessageReceived(msg.Code);
                     }
 
-                    ProcessMessage(msg);
-                    continue;
+                    return true;
                 }
-
-                if (StatementIndex == 0 && Command.Parameters.HasOutputParameters)
+                catch
                 {
-                    // If output parameters are present and this is the first row of the first resultset,
-                    // we must always read it in non-sequential mode because it will be traversed twice (once
-                    // here for the parameters, then as a regular row).
-                    msg = await Connector.ReadMessage(async);
-                    ProcessMessage(msg);
-                    if (msg.Code == BackendMessageCode.DataRow)
-                        PopulateOutputParameters();
-                }
-                else
-                {
-                    msg = await ReadMessage(async);
-                    ProcessMessage(msg);
-                }
+                    // The statement wasn't prepared successfully, update the bookkeeping for it and
+                    // all following statements
+                    if (seenParseComplete)
+                        StatementIndex++;
+                    for (; StatementIndex < _statements.Count; StatementIndex++)
+                    {
+                        var pStatement = _statements[StatementIndex].PreparedStatement;
+                        if (pStatement?.IsPrepared == false)
+                            pStatement.CompleteUnprepare();
+                    }
 
-                switch (msg.Code)
-                {
-                case BackendMessageCode.DataRow:
-                case BackendMessageCode.CompletedResponse:
-                    break;
-                default:
-                    throw Connector.UnexpectedMessageReceived(msg.Code);
+                    throw;
                 }
-
-                return true;
             }
 
             // There are no more queries, we're done. Read to the RFQ.
